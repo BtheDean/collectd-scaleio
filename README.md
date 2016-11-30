@@ -71,5 +71,5 @@ The plugin collects the following data
 
 ## License
 
-See the [LICENSE](LICENSE.txt) file for the project creator license rights and limitations (MIT)  
-See the [CONTRIB_LICENSE](CONTRIB_LICENSE.txt) for the license rights on the contributors portions of code (MIT)
+See the [LICENSE](LICENSE.txt) file for the project creator license rights and limitations (MIT).  
+See the [CONTRIB_LICENSE](CONTRIB_LICENSE.txt) for the license rights on the contributors portions of code (MIT).
