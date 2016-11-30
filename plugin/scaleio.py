@@ -3,31 +3,20 @@
 # vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4 
 
 import collectd
-import subprocess
 import traceback
 import types
-import re
 import json
+import requests
 
 CONF = {
-    'debug':          False,
-    'verbose':        False,
-    'scli_user':      'admin',
-    'scli_password':  'password',
-    'cluster':        'myCluster',
-    'pools':          [],
-    'scli_wrap':      '/usr/share/collectd/python/scli_wrap.sh',
-    'ignoreselected': False,
+    'debug':              False,
+    'verbose':            False,
+    'gateway':            '',
+    'cluster':            'myCluster',
+    'pools':              [],
+    'mdmuser':            '',
+    'mdmpassword':        '',
 }
-
-class AutoVivification(dict):
-    """Implementation of perl's autovivification feature."""
-    def __getitem__(self, item):
-        try:
-            return dict.__getitem__(self, item)
-        except KeyError:
-            value = self[item] = type(self)()
-            return value
 
 def config_callback(conf):
     collectd.debug('config callback')
@@ -40,18 +29,16 @@ def config_callback(conf):
             CONF['debug'] = str2bool(values[0])
         elif key == 'verbose':
             CONF['verbose'] = str2bool(values[0])
+        elif key == 'gateway':
+            CONF['gateway'] = values[0]
         elif key == 'cluster':
             CONF['cluster'] = values[0]
         elif key == 'pools':
             CONF['pools'] = values
-        elif key == 'scli_wrap':
-            CONF['scli_wrap'] = values[0]
-        elif key == 'user':
-            CONF['scli_user'] = values[0]
-        elif key == 'password':
-            CONF['scli_password'] = values[0]
-        elif key == 'ignoreselected':
-            CONF['ignoreselected'] = str2bool(values[0])
+        elif key == 'mdmuser':
+            CONF['mdmuser'] = values[0]
+        elif key == 'mdmpassword':
+            CONF['mdmpassword'] = values[0]
         else:
             collectd.warning('ScaleIO: unknown config key: %s' % (key))
 
@@ -59,9 +46,17 @@ def init_callback():
     my_debug('init callback')
 
 def read_callback(input_data=None):
-    dispatch_pools()
+    try:
+        session_id = gw_login(CONF['gateway'], CONF['mdmuser'], CONF['mdmpassword'])
+        sio_all_pools = sio_get_pools(CONF['gateway'], CONF['mdmuser'], session_id)
+        all_pools_metrics = gw_req_metrics(CONF['gateway'], CONF['mdmuser'], session_id)
+        sio_2proc_pools = sio_select_pools(sio_all_pools, CONF['pools'])
+        sio_parse_metrics(all_pools_metrics, sio_2proc_pools)
+        gw_logout(CONF['gateway'], CONF['mdmuser'], session_id)
+    except:
+        return
 
-
+# Dispatch values to collectd
 def dispatch_value(plugin, value, plugin_instance=None, type_instance=None):
     val = collectd.Values(type = 'gauge')
 
@@ -73,163 +68,199 @@ def dispatch_value(plugin, value, plugin_instance=None, type_instance=None):
     val.values = [value]
     val.dispatch()
 
+# ScaleIO Gateway - Function used for GET and POST requests to the gateway
+def gw_request(login, password, url, headers, data, method):
+    if ( method == "GET" ):
+        headers = {'Connection': 'close'}
+        try:
+            response = requests.get(url, auth=(login, password), verify=False, headers=headers)
+        except requests.exceptions.RequestException as e:
+            my_verbose('Error establishing connection to the ScaleIO Gateway. Check your collectd module configuration. Exiting.')
+            raise
+    elif ( method == "POST" ):
+        headers = {'Content-type': 'application/json', 'Connection': 'close'}
+        try:
+            response = requests.post(url, data=json.dumps(data), auth=(login, password), verify=False, headers=headers)
+        except requests.exceptions.RequestException as e:
+            my_verbose('Error establishing connection to the ScaleIO Gateway. Check your collectd module configuration. Exiting.')
+            raise
+    return response
 
-# Query ScaleIO for pool metrics, and report them to collectd
-def dispatch_pools():
-    pools = read_properties('--query_properties', '--object_type', 'STORAGE_POOL', '--all_objects',
-        '--properties', 'NAME,MAX_CAPACITY_IN_KB,SPARE_CAPACITY_IN_KB,THIN_CAPACITY_ALLOCATED_IN_KB,'
-                        'THICK_CAPACITY_IN_USE_IN_KB,UNUSED_CAPACITY_IN_KB,SNAP_CAPACITY_IN_USE_OCCUPIED_IN_KB,'
-                        'CAPACITY_IN_USE_IN_KB,UNREACHABLE_UNUSED_CAPACITY_IN_KB,DEGRADED_HEALTHY_CAPACITY_IN_KB,'
-                        'FAILED_CAPACITY_IN_KB,USER_DATA_READ_BWC,USER_DATA_WRITE_BWC,REBALANCE_READ_BWC,'
-                        'FWD_REBUILD_READ_BWC,BCK_REBUILD_READ_BWC,AVAILABLE_FOR_THICK_ALLOCATION_IN_KB'
-            )
+# ScaleIO Gateway - Login Function
+def gw_login(gw_address, login, password):
+    url = 'https://%s/api/login' % gw_address
+    headers = {'Connection': 'close'}
+    session_id = gw_request(login, password, url, headers, None, "GET")
+    if ( session_id.status_code == 401 ):
+        my_verbose('Error authenticating to the ScaleIO Gateway. Wrong credential supplied. Check your collectd module configuration. Exiting.')
+        raise
+    return session_id.content.replace("\"", "")
 
-    # We have nothing to report
-    if pools == None:
-        return
+# ScaleIO Gateway - Logout Function
+def gw_logout(gw_address, login, session_id):
+    url = 'https://%s/api/logout' % gw_address
+    headers = {'Connection': 'close'}
+    logout = gw_request(login, session_id, url, headers, None, "GET")
+    if ( logout.status_code == 401 ):
+        my_verbose('Error authenticating to the ScaleIO Gateway. SessionID used for REST-API authentication is expired or invalid. Check your collectd module configuration. Exiting.')
+        raise
 
-    for pool_id, pool in pools.iteritems():
-        # skip pools based on configuration
-        if len(CONF['pools']) > 0 and not CONF['ignoreselected'] and pool['NAME'] not in CONF['pools']:
-            my_verbose('Pool %s is not in pools configuration and ignoreselected is false -> skipping' % (pool['NAME']))
-            continue
-        if len(CONF['pools']) > 0 and CONF['ignoreselected'] and pool['NAME'] in CONF['pools']:
-            my_verbose('Pool %s is in pools configuration and ignoreselected is true -> skipping' % (pool['NAME']))
-            continue
+# ScaleIO Gateway - Request metrics that will be parsed and dispatched to collectd
+def gw_req_metrics(gw_address, login, session_id):
+    url = 'https://%s/api/types/StoragePool/instances/action/querySelectedStatistics' % gw_address
+    headers = {'Content-type': 'application/json', 'Connection': 'close'}
+    data = { 'allIds': '', 'properties': [ 'maxCapacityInKb', 'capacityAvailableForVolumeAllocationInKb', 'capacityInUseInKb', 
+             'thinCapacityAllocatedInKm', 'thickCapacityInUseInKb', 'snapCapacityInUseOccupiedInKb', 'unreachableUnusedCapacityInKb', 
+             'degradedHealthyCapacityInKb', 'failedCapacityInKb', 'spareCapacityInKb', 'primaryReadBwc', 'primaryWriteBwc', 
+             'rebalanceReadBwc', 'fwdRebuildReadBwc', 'bckRebuildReadBwc' ] }   
+    metrics = gw_request(login, session_id, url, headers, data, "POST")
+    if ( metrics.status_code == 401 ):
+        my_verbose('Error authenticating to the ScaleIO Gateway. SessionID used for REST-API authentication is expired or invalid. Check your collectd module configuration. Exiting.')
+        raise
+    metrics = json.loads(json.dumps(metrics.json()))
+    return metrics
+
+# ScaleIO Gateway - Get StoragePools list (name, ID)
+def sio_get_pools(gw_address, login, session_id):
+    sio_all_pools = []
+    url = 'https://%s/api/types/StoragePool/instances' % gw_address
+    headers = { 'Connection': 'close' }
+    pools = gw_request(login, session_id, url, headers, None, "GET")
+    if ( pools.status_code == 401 ):
+        my_verbose('Error authenticating to the ScaleIO Gateway. SessionID used for REST-API authentication is expired or invalid. Check your collectd module configuration. Exiting.')
+        raise
+    pools = json.loads(json.dumps(pools.json()))
+    for i in range ( 0, len(pools) ):
+        sio_all_pools.append([pools[i]['name'], pools[i]['id']])
+    return sio_all_pools
+
+# Select StoragePools to be processed according configuration
+def sio_select_pools(sio_all_pools, sio_req_pools):
+    sio_2proc_pools = []
+    for i in range ( 0, len(sio_req_pools) ):
+        found = False
+        for j in range ( 0, len(sio_all_pools) ):
+            if ( sio_req_pools[i] == sio_all_pools[j][0] ):
+                sio_2proc_pools.append([sio_all_pools[j][0], sio_all_pools[j][1]])
+                found = True
+        if found == False:
+            my_verbose('Requested pool: "%s" doesn\'t exist on your ScaleIO System. Check your collectd module configuration.\n' % sio_req_pools[i])
+    if ( len(sio_2proc_pools) == 0 ):
+        my_verbose('Can\'t find any requested pool to process on your ScaleIO System. Check your collectd module configuration. Exiting.')
+        raise
+    return sio_2proc_pools
+
+# Parse JSON objects returned by ScaleIO gateway and prepares values to be dispatched to collectd
+def sio_parse_metrics(all_pools_metrics, sio_2proc_pools):
+    for i in range ( 0, len(sio_2proc_pools) ):
+        read_iops = read_bps = write_iops = write_bps = rebalance_iops = rebalance_bps = fwd_rebuild_iops = fwd_rebuild_bps = bck_rebuild_iops = bck_rebuild_bps = total_iops = 0
+
+        current_pool_metrics = all_pools_metrics[sio_2proc_pools[i][1]]
 
         # raw capacity
-        dispatch_value('pool', long(pool['MAX_CAPACITY_IN_KB']) / 2, pool['NAME'], 'raw_bytes')
+        raw_bytes = KB_to_Bytes(current_pool_metrics['maxCapacityInKb'] / 2)
+        dispatch_value('pool', raw_bytes, sio_2proc_pools[i][0], 'raw_bytes')
 
         # useable capacity
-        dispatch_value('pool',
-            long(pool['AVAILABLE_FOR_THICK_ALLOCATION_IN_KB']) + long(pool['CAPACITY_IN_USE_IN_KB']) / 2,
-            pool['NAME'], 'useable_bytes')
+        useable_bytes = KB_to_Bytes(current_pool_metrics['capacityAvailableForVolumeAllocationInKb'] + 
+                                    current_pool_metrics['capacityInUseInKb'] / 2)
+        dispatch_value('pool', useable_bytes, sio_2proc_pools[i][0], 'useable_bytes')
 
         # available capacity
-        dispatch_value('pool',
-            long(pool['AVAILABLE_FOR_THICK_ALLOCATION_IN_KB']),
-            pool['NAME'], 'available_bytes')
+        available_bytes = KB_to_Bytes(current_pool_metrics['capacityAvailableForVolumeAllocationInKb'])
+        dispatch_value('pool', available_bytes, sio_2proc_pools[i][0], 'available_bytes')
 
         # used capacity
-        dispatch_value('pool', (long(pool['CAPACITY_IN_USE_IN_KB'])) / 2, pool['NAME'], 'used_bytes')
+        used_bytes = KB_to_Bytes(current_pool_metrics['capacityInUseInKb'] / 2)
+        dispatch_value('pool', used_bytes, sio_2proc_pools[i][0], 'used_bytes')
 
         # allocated capacity
-        dispatch_value('pool',
-            (long(pool['THIN_CAPACITY_ALLOCATED_IN_KB']) +
-                long(pool['THICK_CAPACITY_IN_USE_IN_KB']) + long(pool['SNAP_CAPACITY_IN_USE_OCCUPIED_IN_KB'])) / 2,
-            pool['NAME'], 'allocated_bytes')
+        allocated_bytes = (KB_to_Bytes(current_pool_metrics['thinCapacityAllocatedInKm']) + 
+                           KB_to_Bytes(current_pool_metrics['thickCapacityInUseInKb']) + 
+                           KB_to_Bytes(current_pool_metrics['snapCapacityInUseOccupiedInKb'])) / 2
+        dispatch_value('pool', allocated_bytes, sio_2proc_pools[i][0], 'allocated_bytes')
 
         # unreachable unused capacity
-        dispatch_value('pool', long(pool['UNREACHABLE_UNUSED_CAPACITY_IN_KB']) / 2, pool['NAME'], 'unreachable_unused_bytes')
+        unreachable_unused_bytes = KB_to_Bytes(current_pool_metrics['unreachableUnusedCapacityInKb'])
+        dispatch_value('pool', unreachable_unused_bytes, sio_2proc_pools[i][0], 'unreachable_unused_bytes')
 
         # degraded capacity
-        dispatch_value('pool', long(pool['DEGRADED_HEALTHY_CAPACITY_IN_KB']), pool['NAME'], 'degraded_bytes')
+        degraded_bytes = KB_to_Bytes(current_pool_metrics['degradedHealthyCapacityInKb'])
+        dispatch_value('pool', degraded_bytes, sio_2proc_pools[i][0], 'degraded_bytes')
 
         # failed capacity
-        dispatch_value('pool', long(pool['FAILED_CAPACITY_IN_KB']) / 2, pool['NAME'], 'failed_bytes')
+        failed_bytes = KB_to_Bytes(current_pool_metrics['failedCapacityInKb'])
+        dispatch_value('pool', failed_bytes, sio_2proc_pools[i][0], 'failed_bytes')
 
         # spare capacity
-        dispatch_value('pool', long(pool['SPARE_CAPACITY_IN_KB']), pool['NAME'], 'spare_bytes')
+        spare_bytes = KB_to_Bytes(current_pool_metrics['spareCapacityInKb'])
+        dispatch_value('pool', spare_bytes, sio_2proc_pools[i][0], 'spare_bytes')
 
+        # read IOPS / read throughput
+        t_read_metrics = current_pool_metrics['primaryReadBwc']
 
+        t_read_iops = t_read_metrics['numOccured']
+        t_read_bytes = KB_to_Bytes(t_read_metrics['totalWeightInKb'])
+        t_read_nsec = t_read_metrics['numSeconds']
+        if ( t_read_iops != 0 ):
+            read_iops = ( t_read_iops / t_read_nsec )
+            read_bps = ( t_read_bytes / t_read_nsec )
 
-        # user data read IOPS
-        dispatch_value('pool', long(pool['USER_DATA_READ_BWC']['IOPS']), pool['NAME'], 'read_iops')
+        dispatch_value('pool', read_iops, sio_2proc_pools[i][0], 'read_iops')
+        dispatch_value('pool', read_bps, sio_2proc_pools[i][0], 'read_bps')
 
-        # user data read throughput
-        dispatch_value('pool', long(pool['USER_DATA_READ_BWC']['BPS']), pool['NAME'], 'read_bps')
+        # write IOPS / write throughput
+        t_write_metrics = current_pool_metrics['primaryWriteBwc']
 
-        # user data write IOPS
-        dispatch_value('pool', long(pool['USER_DATA_WRITE_BWC']['IOPS']), pool['NAME'], 'write_iops')
+        t_write_iops = t_write_metrics['numOccured']
+        t_write_bytes = KB_to_Bytes(t_write_metrics['totalWeightInKb'])
+        t_write_nsec = t_write_metrics['numSeconds']
+        if ( t_write_iops != 0 ):
+            write_iops = ( t_write_iops / t_write_nsec )
+            write_bps = ( t_write_bytes / t_write_nsec )
 
-        # user data write throughput
-        dispatch_value('pool', long(pool['USER_DATA_WRITE_BWC']['BPS']), pool['NAME'], 'write_bps')
+        dispatch_value('pool', write_iops, sio_2proc_pools[i][0], 'write_iops')
+        dispatch_value('pool', write_bps, sio_2proc_pools[i][0], 'write_bps')
 
-        # rebalance IOPS
-        dispatch_value('pool', long(pool['REBALANCE_READ_BWC']['IOPS']), pool['NAME'], 'rebalance_iops')
+        # rebalance IOPS / rebalance throughput
+        t_rebal_read_metrics = current_pool_metrics['rebalanceReadBwc']
 
-        # rebalance throughput
-        dispatch_value('pool', long(pool['REBALANCE_READ_BWC']['BPS']), pool['NAME'], 'rebalance_bps')
+        t_rebal_read_iops = t_rebal_read_metrics['numOccured']
+        t_rebal_read_bytes = KB_to_Bytes(t_rebal_read_metrics['totalWeightInKb'])
+        t_rebal_read_nsec = t_rebal_read_metrics['numSeconds']
+        if ( t_rebal_read_iops != 0 ):
+            rebalance_iops = ( t_rebal_read_iops / t_rebal_read_nsec )
+            rebalance_bps = ( t_rebal_read_bytes / t_rebal_read_nsec )
 
-        # rebuild IOPS
-        dispatch_value('pool',
-            long(pool['FWD_REBUILD_READ_BWC']['IOPS'])  +
-                long(pool['BCK_REBUILD_READ_BWC']['IOPS']),
-            pool['NAME'], 'rebuild_iops')
+        dispatch_value('pool', rebalance_iops, sio_2proc_pools[i][0], 'rebalance_iops')
+        dispatch_value('pool', rebalance_bps, sio_2proc_pools[i][0], 'rebalance_bps')
 
-        # rebuild throughput
-        dispatch_value('pool',
-            long(pool['FWD_REBUILD_READ_BWC']['BPS']) +
-                long(pool['BCK_REBUILD_READ_BWC']['BPS']),
-            pool['NAME'], 'rebuild_bps')
+        # rebuild IOPS / rebuild throughput
+        t_fwdrebui_read_metrics = current_pool_metrics['fwdRebuildReadBwc']
 
-# Execute a scli --query_properties command and convert the CLI output to a dict/JSON
-def read_properties(*cmd):
-    properties = AutoVivification()
-    out = None
-    real_cmd = (CONF['scli_wrap'],CONF['scli_user'],CONF['scli_password']) + cmd
-    my_verbose('Executing command: %s %s ******* %s' % (CONF['scli_wrap'], CONF['scli_user'], " ".join(str(v) for v in cmd)))
+        t_fwdrebui_read_iops = t_fwdrebui_read_metrics['numOccured']
+        t_fwdrebui_read_bytes = KB_to_Bytes(t_fwdrebui_read_metrics['totalWeightInKb'])
+        t_fwdrebui_read_nsec = t_fwdrebui_read_metrics['numSeconds']
+        if ( t_fwdrebui_read_iops != 0 ):
+            fwd_rebuild_iops = t_fwdrebui_read_iops / t_fwdrebui_read_nsec
+            fwd_rebuild_bps = t_fwdrebui_read_bytes / t_fwdrebui_read_nsec
 
-    try:
-        out = subprocess.check_output(real_cmd, stderr=subprocess.STDOUT)
-        my_debug('scli output: ' + out)
-    except Exception as e:
-        collectd.error('ScaleIO: error on executing scli command %s --- %s' %
-            (e, traceback.format_exc()))
-        return
+        t_bckrebui_read_metrics = current_pool_metrics['bckRebuildReadBwc']
 
-    if 'Failed to connect to MDM 127.0.0.1:6611' in out:
-        my_verbose('plugin is running on non-primary/active MDM, skipping data collection')
+        t_bckrebui_read_iops = t_bckrebui_read_metrics['numOccured']
+        t_bckrebui_read_bytes = KB_to_Bytes(t_bckrebui_read_metrics['totalWeightInKb'])
+        t_bckrebui_read_nsec = t_bckrebui_read_metrics['numSeconds']
+        if ( t_bckrebui_read_iops != 0 ):
+            bck_rebuild_iops = t_bckrebui_read_iops / t_bckrebui_read_nsec
+            bck_rebuild_bps = t_bckrebui_read_bytes / t_bckrebui_read_nsec
 
+        rebuild_iops = fwd_rebuild_iops + bck_rebuild_iops
+        rebuild_bps = fwd_rebuild_bps + bck_rebuild_bps
+        dispatch_value('pool', rebuild_iops, sio_2proc_pools[i][0], 'rebuild_iops')
+        dispatch_value('pool', rebuild_bps, sio_2proc_pools[i][0], 'rebuild_bps')
 
-    group_name = None
-    group_regex = re.compile("^([^\s]+)\s([^:]+)")
-    kv_regex = re.compile("^\s+([^\s]+)\s+(.*)$")
-    for line in out.split('\n'):
-        new_group_match = group_regex.match(line)
-        if new_group_match:
-            group_name = new_group_match.group(2)
-        else:
-            kv_match = kv_regex.match(line)
-            if kv_match:
-                properties[group_name][kv_match.group(1)] = kv_match.group(2)
-
-    my_verbose('Read properties: %s' % (json.dumps(properties)))
-    rectify_dict(properties)
-    my_debug('Properties after rectify: %s' % (json.dumps(properties)))
-    return properties
-
-# Recitify the properties read from the command line:
-#  - convert units such as KB,MB,GB to bytes
-#  - interpret the BWC values and extract IOPS, Throughput
-def rectify_dict(var):
-    for key, val in var.iteritems():
-        if type(val) is dict or type(val) is AutoVivification:
-            rectify_dict(val)
-        elif type(val) is str:
-            if key.endswith('BWC'):
-                var[key] = convert_bwc_to_dict(val)
-            else:
-                var[key] = convert_units_to_bytes(val)
-
-def convert_bwc_to_dict(val):
-    m = re.search('([0-9]+) IOPS (.*) per-second', val, re.I)
-    return {'IOPS': m.group(1), 'BPS': convert_units_to_bytes(m.group(2))}
-
-def convert_units_to_bytes(val):
-    val = convert_unit_to_bytes(val, "Bytes", 0)
-    val = convert_unit_to_bytes(val, "KB", 1)
-    val = convert_unit_to_bytes(val, "MB", 2)
-    val = convert_unit_to_bytes(val, "GB", 3)
-    val = convert_unit_to_bytes(val, "TB", 4)
-    val = convert_unit_to_bytes(val, "PB", 5)
-    return val
-
-def convert_unit_to_bytes(val, unit, power):
-    m = re.search('([0-9\.]+) ' + unit, val, re.I)
-    if m:
-        return str(long(m.group(1)) * (1024 ** power))
-    return val
+def KB_to_Bytes(value):
+    return value * 1024 ** 1
 
 def str2bool(v):
     if type(v) == types.BooleanType:
