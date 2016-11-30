@@ -8,7 +8,7 @@ General requirements:
 * The collectd plugin can be installed on a standalone linux installation that can connect to the ScaleIO gateway using HTTPS.
 * This collectd plugin is written in Python and thus requires the collectd-python plugin and python-requests module to work correctly.
 
-### Install Manually the collectd plugin
+### Install the collectd plugin
 Copy the files manually from the plugin folder to the module path, ie:
 ```bash
 cp plugin/scaleio.py /usr/share/collectd/python
